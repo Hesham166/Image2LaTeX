@@ -24,6 +24,7 @@ class DataConfig:
     local_dir: str = "../data/im2latex-100k"
     pad_fill: int = 255
     force_download: bool = False
+    move_to_local: bool = False
 
 
 def ensure_dataset(config: DataConfig) -> str:
@@ -33,7 +34,11 @@ def ensure_dataset(config: DataConfig) -> str:
     cache_path = kagglehub.dataset_download(config.dataset_handle, force_download=config.force_download)
     target = os.path.abspath(config.local_dir)
 
-    if not os.path.exists(target) or not os.lsitdir(target):
+    if not config.move_to_local:
+        logger.info(f"Using dataset in-place at: {cache_path}")
+        return cache_path
+
+    if not os.path.exists(target) or not os.listdir(target):
         os.makedirs(target, exist_ok=True)
         logger.info(f"Copying dataset to {target}")
 
@@ -43,9 +48,8 @@ def ensure_dataset(config: DataConfig) -> str:
                 (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, dst)
         else:
             shutil.copy2(cache_path, target)
-    
-    return target
 
+    return target
 
 class Vocab:
     """Vocabulary for token-to-index mapping."""
@@ -174,7 +178,8 @@ def get_loaders(config: DataConfig = None):
     
     loader_kwargs = {
         'batch_size': config.batch_size,
-        'collate_fn': lambda b: collate_fn(b, vocab.pad_idx)
+        'collate_fn': lambda b: collate_fn(b, vocab.pad_idx),
+        'num_workers': 0
     }
     
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)

@@ -139,7 +139,8 @@ class Trainer:
         self.model.eval()
         losses = []
         
-        for imgs, tgts in tqdm(loader, desc="Evaluating", leave=False):
+        print("Start Eval")
+        for imgs, tgts in tqdm(loader, desc="Evaluating"):
             imgs, tgts = imgs.to(self.device), tgts.to(self.device)
             if imgs.numel() == 0:
                 continue

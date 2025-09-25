@@ -137,21 +137,13 @@ class Trainer:
 
     def evaluate(self, loader):
         self.model.eval()
-        losses = []
-        
-        print("Start Eval")
-        for imgs, tgts in tqdm(loader, desc="Evaluating"):
-            imgs, tgts = imgs.to(self.device), tgts.to(self.device)
-            if imgs.numel() == 0:
-                continue
-                
-            logits = self.model(imgs, tgts[:, :-1])
-            loss = self.criterion(logits.reshape(-1, logits.size(-1)), tgts[:, 1:].reshape(-1))
-            losses.append(loss.item())
-
-        metrics = evaluate_metrics(self.vocab, self.model, loader, device=self.device)
-        avg_loss = sum(losses) / max(1, len(losses))
-        
+        avg_loss, metrics = evaluate_metrics(
+            self.vocab, 
+            self.model, 
+            loader, 
+            self.criterion, 
+            device=self.device
+        )
         return avg_loss, metrics
 
     def save_checkpoint(self, epoch, val_loss, val_metrics, best=False):

@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 from Levenshtein import distance as levenshtein_distance
+from tqdm import tqdm
 
 
 def compute_bleu(references: List[str], hypotheses: List[str]) -> float:
@@ -50,29 +51,38 @@ def compute_exact_match(references: List[str], hypotheses: List[str]) -> float:
 
 
 @torch.no_grad()
-def evaluate_metrics(vocab, model, loader, device="cuda"):
+def evaluate_metrics(vocab, model, loader, criterion, device="cuda"):
     """
-    Evaluate BLEU, edit distance, exact match on a dataloader.
-    Args:
-        vocab: Vocab object with .decode()
-        model: ConvMath model
-        loader: DataLoader
-        device: torch device
-    Returns:
-        dict with 'bleu', 'edit_distance', 'exact_match'
+    Evaluate loss, BLEU, edit distance, exact match on a dataloader.
     """
     model.eval()
     refs, hyps = [], []
-    for imgs, tgts in loader:
+    total_loss = 0
+    num_samples = 0
+    
+    for imgs, tgts in tqdm(loader, desc="Evaluating"):
         if imgs.numel() == 0:
             continue
         imgs, tgts = imgs.to(device), tgts.to(device)
+        
+        # --- Loss Calculation ---
+        logits = model(imgs, tgts[:, :-1])
+        loss = criterion(logits.reshape(-1, logits.size(-1)), tgts[:, 1:].reshape(-1))
+        total_loss += loss.item() * imgs.size(0) # Weight loss by batch size
+        num_samples += imgs.size(0)
+
+        # --- Metric Calculation ---
         preds = model(imgs)  # greedy generation
         for pred, tgt in zip(preds, tgts):
             refs.append(vocab.decode(tgt.tolist()))
             hyps.append(vocab.decode(pred.tolist()))
-    return {
+            
+    avg_loss = total_loss / max(1, num_samples)
+    
+    metrics = {
         "bleu": compute_bleu(refs, hyps),
         "edit_distance": compute_edit_distance(refs, hyps),
         "exact_match": compute_exact_match(refs, hyps),
     }
+    
+    return avg_loss, metrics

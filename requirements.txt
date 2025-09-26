@@ -6,3 +6,5 @@ tqdm
 wandb
 nltk
 python-Levenshtein
+kagglehub
+warmup-scheduler

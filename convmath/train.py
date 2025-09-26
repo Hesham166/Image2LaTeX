@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
+from warmup_scheduler import GradualWarmupScheduler
 from tqdm import tqdm
 import wandb
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ class TrainingConfig:
     scheduler_step: int = 3
     scheduler_gamma: float = 0.8
     scheduler_patience: int = 3         # for plateau scheduler
+    warmup_steps = 512
 
     optimizer_type: str = "adamw"       # "sgd", "adam", "adamw"
     momentum: float = 0.9
@@ -69,18 +71,18 @@ class Trainer:
 
     def _create_scheduler(self):
         if self.config.scheduler_type.lower() == "step":
-            return optim.lr_scheduler.StepLR(
+            main_scheduler = optim.lr_scheduler.StepLR(
                 self.optimizer, 
                 step_size=self.config.scheduler_step, 
                 gamma=self.config.scheduler_gamma
             )
         elif self.config.scheduler_type.lower() == "cosine":
-            return optim.lr_scheduler.CosineAnnealingLR(
+            main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, 
                 T_max=self.config.num_epochs
             )
         elif self.config.scheduler_type.lower() == "plateau":
-            return optim.lr_scheduler.ReduceLROnPlateau(
+            main_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, 
                 mode='max',  # maximize BLEU
                 patience=self.config.scheduler_patience,
@@ -88,6 +90,16 @@ class Trainer:
             )
         else:
             return None
+        
+        warmup_steps = self.config.warmup_steps
+        warmup_scheduler = GradualWarmupScheduler(
+            self.optimizer, 
+            multiplier=1,
+            total_epoch=warmup_steps,
+            after_scheduler=main_scheduler
+        )
+        
+        return warmup_scheduler
 
     def _step(self, batch, train=True):
         imgs, tgts = [x.to(self.device) for x in batch]
@@ -100,6 +112,17 @@ class Trainer:
         if train:
             self.optimizer.zero_grad()
             loss.backward()
+
+            # Log the raw gradient value
+            total_norm = 0
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            
+            if self.global_step % self.config.log_freq == 0:
+                wandb.log({"gradient_norm": total_norm})
             
             if self.config.clip_grad > 0:
                 clip_grad_norm_(self.model.parameters(), self.config.clip_grad)
@@ -121,6 +144,9 @@ class Trainer:
                 losses.append(loss)
                 avg_loss = sum(losses) / len(losses)
                 pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{self.optimizer.param_groups[0]['lr']:.2e}")
+
+                if self.scheduler and self.config.scheduler_type.lower() != "plateau":
+                    self.scheduler.step()
                 
                 if batch_idx % self.config.log_freq == 0:
                     wandb.log({
@@ -129,10 +155,6 @@ class Trainer:
                         "learning_rate": self.optimizer.param_groups[0]["lr"],
                     })
         
-        # Step scheduler if not plateau
-        if self.scheduler and self.config.scheduler_type.lower() != "plateau":
-            self.scheduler.step()
-            
         return sum(losses) / max(1, len(losses))
 
     def evaluate(self, loader):

@@ -19,13 +19,13 @@ class TrainingConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     clip_grad: float = 5.0
-    num_epochs = 20
+    num_epochs = 50
 
-    scheduler_type: str = "step"        # "step", "cosine", "plateau"
+    scheduler_type: str = "cosine"        # "step", "cosine", "plateau"
     scheduler_step: int = 3
     scheduler_gamma: float = 0.8
     scheduler_patience: int = 3         # for plateau scheduler
-    warmup_steps = 512
+    warmup_steps = 1024
 
     optimizer_type: str = "adamw"       # "sgd", "adam", "adamw"
     momentum: float = 0.9
@@ -35,12 +35,12 @@ class TrainingConfig:
     validation_freq: int = 1            # validate every N epochs
     save_freq: int = 1                  # save checkpoint every N epochs
     
-    log_freq: int = 16                  # log every N batches
+    log_freq: int = 10                  # log every N batches
     wandb_project: str = "ConvMath"
 
 
 class Trainer:
-    def __init__(self, model, vocab, config: TrainingConfig, device='cuda'):
+    def __init__(self, model, vocab, config: TrainingConfig, train_loader, device='cuda'):
         self.model = model.to(device)
         self.vocab = vocab
         self.device = device
@@ -48,7 +48,7 @@ class Trainer:
         
         self.criterion = nn.CrossEntropyLoss(ignore_index=vocab.pad_idx)
         self.optimizer = self._create_optimizer()
-        self.scheduler = self._create_scheduler()
+        self.scheduler = self._create_scheduler(train_loader)
         
         self.save_dir = config.save_dir
         os.makedirs(self.save_dir, exist_ok=True)
@@ -65,21 +65,23 @@ class Trainer:
         elif self.config.optimizer_type.lower() == "adam":
             return optim.Adam(params, lr=self.config.lr, weight_decay=self.config.weight_decay)
         elif self.config.optimizer_type.lower() == "adamw":
-            return optim.AdamW(params, lr=self.config.lr, weight_decay=self.config.weight_decay)
+            return optim.AdamW(params, lr=self.config.lr, weight_decay=self.config.weight_decay, eps=1e-7)
             
         raise ValueError(f"Unknown optimizer: {self.config.optimizer_type}")
 
-    def _create_scheduler(self):
+    def _create_scheduler(self, train_loader):
         if self.config.scheduler_type.lower() == "step":
+            step_size_in_steps = self.config.scheduler_step * len(train_loader)
             main_scheduler = optim.lr_scheduler.StepLR(
                 self.optimizer, 
-                step_size=self.config.scheduler_step, 
+                step_size=step_size_in_steps,
                 gamma=self.config.scheduler_gamma
             )
         elif self.config.scheduler_type.lower() == "cosine":
+            total_steps = len(train_loader) * self.config.num_epochs
             main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, 
-                T_max=self.config.num_epochs
+                T_max = total_steps - self.config.warmup_steps
             )
         elif self.config.scheduler_type.lower() == "plateau":
             main_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -91,11 +93,10 @@ class Trainer:
         else:
             return None
         
-        warmup_steps = self.config.warmup_steps
         warmup_scheduler = GradualWarmupScheduler(
-            self.optimizer, 
+            self.optimizer,
             multiplier=1,
-            total_epoch=warmup_steps,
+            total_epoch=self.config.warmup_steps,
             after_scheduler=main_scheduler
         )
         
@@ -143,7 +144,7 @@ class Trainer:
             if loss is not None:
                 losses.append(loss)
                 avg_loss = sum(losses) / len(losses)
-                pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{self.optimizer.param_groups[0]['lr']:.2e}")
+                pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{self.scheduler.get_last_lr()[0]:.2e}")
 
                 if self.scheduler and self.config.scheduler_type.lower() != "plateau":
                     self.scheduler.step()
@@ -152,7 +153,7 @@ class Trainer:
                     wandb.log({
                         "train_batch_loss": loss,
                         "train_avg_loss": avg_loss,
-                        "learning_rate": self.optimizer.param_groups[0]["lr"],
+                        "learning_rate": self.scheduler.get_last_lr()[0],
                     })
         
         return sum(losses) / max(1, len(losses))
@@ -223,7 +224,7 @@ def train_model(train_loader, val_loader, vocab, config: TrainingConfig, device=
     
     model_config = ConvMathConfig(vocab_size=len(vocab))
     model = ConvMath(model_config)
-    trainer = Trainer(model, vocab, config, device=device)
+    trainer = Trainer(model, vocab, config, train_loader, device=device)
     
     start_epoch = 1
     if resume_from:

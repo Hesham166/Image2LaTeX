@@ -185,15 +185,10 @@ class ConvMath(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """weight initialization."""
+        """Kaiming He initialization for ReLU-based networks."""
         for n, p in self.named_parameters():
             if p.dim() > 1:
-                if 'embedding' in n:
-                    nn.init.normal_(p, mean=0, std=0.1)
-                elif 'output_proj' in n:
-                    nn.init.xavier_uniform_(p, gain=0.1)  # Smaller gain for output layer
-                else:
-                    nn.init.xavier_uniform_(p)
+                nn.init.kaiming_uniform_(p, a=math.sqrt(5))
             elif 'bias' in n:
                 nn.init.zeros_(p)
 

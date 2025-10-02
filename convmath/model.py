@@ -96,33 +96,41 @@ class PositionalEmbedding(nn.Module):
         return x + pe.unsqueeze(0)                          # broadcast to (batch, seq_len, d_model)
     
 
-class GLU(nn.Module):
-    """Gated Linear Unit with 1D convolution."""
+class CausalGLU(nn.Module):
+    """Causal Gated Linear Unit with 1D convolution."""
 
     def __init__(self, d_model: int, kernel_size: int = 3):
         super().__init__()
-
-        self.conv = nn.Conv1d(d_model, 2 * d_model, kernel_size=kernel_size, padding=kernel_size // 2)
+        
+        # Use causal padding (left-padding only)
+        self.kernel_size = kernel_size
+        self.padding = kernel_size - 1  # Full left padding
+        self.conv = nn.Conv1d(d_model, 2 * d_model, kernel_size=kernel_size, padding=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_t = x.transpose(1, 2)                 # (batch, seq_len, d_model) -> (batch, d_model, seq_len)
-        conv_out = self.conv(x_t)               # (batch, 2*d_model, seq_len)
-        conv_out = conv_out.transpose(1, 2)     # (batch, seq_len, 2*d_model)
-        a, b = conv_out.chunk(2, dim=-1)        # each (batch, seq_len, d_model)
+        x_t = x.transpose(1, 2)  # (batch, seq_len, d_model) -> (batch, d_model, seq_len)
+        
+        # Apply causal padding manually
+        x_t = F.pad(x_t, (self.padding, 0))
+        
+        conv_out = self.conv(x_t)  # (batch, 2*d_model, seq_len)
+        conv_out = conv_out.transpose(1, 2)  # (batch, seq_len, 2*d_model)
+        
+        a, b = conv_out.chunk(2, dim=-1)
         return a * torch.sigmoid(b)
 
 
 class ConvDecoderLayer(nn.Module):
-    """Single convolutional decoder layer with GLU, layer norm, residual, and per-layer attention."""
+    """Single convolutional decoder layer with causal GLU, layer norm, residual, and cross-attention."""
 
     def __init__(self, d_model: int, kernel_size: int = 3):
         super().__init__()
 
-        self.glu = GLU(d_model, kernel_size)
+        self.glu = CausalGLU(d_model, kernel_size)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         
-        # Separate projections for query, key, value
+        # Cross-attention projections
         self.query_proj = nn.Linear(d_model, d_model)
         self.key_proj = nn.Linear(d_model, d_model)
         self.value_proj = nn.Linear(d_model, d_model)
@@ -131,7 +139,7 @@ class ConvDecoderLayer(nn.Module):
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x: torch.Tensor, encoder_outputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # First sublayer: GLU with residual and norm
+        # First sublayer: Causal GLU with residual and norm
         residual = x
         x = self.glu(x)
         x = self.dropout(x)
@@ -140,17 +148,15 @@ class ConvDecoderLayer(nn.Module):
         # Second sublayer: Cross-attention with residual and norm
         residual = x
         
-        # Cross-attention: queries from decoder, keys/values from encoder
-        queries = self.query_proj(x)  # (batch, tgt_len, d_model)
-        keys = self.key_proj(encoder_outputs)  # (batch, src_len, d_model)
-        values = self.value_proj(encoder_outputs)  # (batch, src_len, d_model)
+        queries = self.query_proj(x)
+        keys = self.key_proj(encoder_outputs)
+        values = self.value_proj(encoder_outputs)
         
-        # Scaled dot-product attention
         scores = torch.bmm(queries, keys.transpose(1, 2)) / math.sqrt(x.size(-1))
-        attn_weights = F.softmax(scores, dim=-1)  # (batch, tgt_len, src_len)
+        attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
         
-        context = torch.bmm(attn_weights, values)  # (batch, tgt_len, d_model)
+        context = torch.bmm(attn_weights, values)
         context = self.out_proj(context)
         context = self.dropout(context)
         
@@ -185,12 +191,22 @@ class ConvMath(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Kaiming He initialization for ReLU-based networks."""
-        for n, p in self.named_parameters():
-            if p.dim() > 1:
-                nn.init.kaiming_uniform_(p, a=math.sqrt(5))
-            elif 'bias' in n:
-                nn.init.zeros_(p)
+        """Selective initialization - avoid BatchNorm and embeddings."""
+        for name, module in self.named_modules():
+            # Skip BatchNorm - it has good defaults
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.LayerNorm)):
+                continue
+            
+            # Initialize embeddings with normal distribution
+            if isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0, std=self.d_model ** -0.5)
+            
+            # Initialize linear and conv layers
+            elif isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
+                if hasattr(module, 'weight') and module.weight is not None:
+                    nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+                if hasattr(module, 'bias') and module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, images: torch.Tensor, target_tokens: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -198,7 +214,7 @@ class ConvMath(nn.Module):
             images: (batch, 1, H, W)
             target_tokens: (batch, tgt_len) (optional) - if provided, do teacher-forcing training forward
         """
-        encoder_outputs = self._encode_images(images)  # (batch, src_len, d_model)
+        encoder_outputs = self._encode_images(images)
 
         if target_tokens is not None:
             return self._forward_train(encoder_outputs, target_tokens)
@@ -206,17 +222,11 @@ class ConvMath(nn.Module):
             return self._generate(encoder_outputs)
 
     def _encode_images(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Encode images to feature vectors and add positional embeddings.
-        Returns: encoder_outputs (batch, src_len, d_model)
-        """
-        features = self.image_encoder(images)               # (batch, 512, H', W')
+        """Encode images to feature vectors and add positional embeddings."""
+        features = self.image_encoder(images)
         batch_size, channels, h, w = features.size()
 
-        # Flatten spatial dims: (batch, channels, H'*W') -> (batch, H'*W', channels)
         features = features.view(batch_size, channels, -1).transpose(1, 2)
-        
-        # Project to d_model and add positional embeddings
         features = self.feature_proj(features)
         features = self.dropout(features)
         features = self.pos_embedding(features)
@@ -225,7 +235,8 @@ class ConvMath(nn.Module):
 
     def _forward_train(self, encoder_outputs: torch.Tensor, target_tokens: torch.Tensor) -> torch.Tensor:
         """Training forward pass with teacher forcing."""
-        token_emb = self.token_embedding(target_tokens) * math.sqrt(self.d_model)
+        # Reduce scaling factor for stability
+        token_emb = self.token_embedding(target_tokens)
         decoder_input = self.pos_embedding(token_emb)
         decoder_input = self.dropout(decoder_input)
 
@@ -238,38 +249,29 @@ class ConvMath(nn.Module):
         return logits
 
     def _generate(self, encoder_outputs: torch.Tensor, max_len: int = 256) -> torch.Tensor:
-        """
-        Autoregressive generation (greedy decoding).
-        Returns generated token ids (batch, generated_len)
-        """
+        """Autoregressive generation (greedy decoding)."""
         batch_size = encoder_outputs.size(0)
         device = encoder_outputs.device
 
         generated = torch.full((batch_size, 1), self.config.start_token, dtype=torch.long, device=device)
 
         for _step in range(max_len):
-            token_emb = self.token_embedding(generated) * math.sqrt(self.d_model)
+            token_emb = self.token_embedding(generated)
             decoder_input = self.pos_embedding(token_emb)
 
             h = decoder_input
             for layer in self.decoder_layers:
                 h, _ = layer(h, encoder_outputs)
 
-            # Get logits for the very last token in the sequence
-            logits = self.output_proj(h[:, -1:, :])  # Shape: (batch, 1, vocab_size)
+            logits = self.output_proj(h[:, -1:, :])
+            next_token = torch.argmax(logits, dim=-1)
 
-            # Greedy decoding: select the token with the highest logit score
-            next_token = torch.argmax(logits, dim=-1)  # Shape: (batch, 1)
-
-            # Append the newly predicted token to the sequence
             generated = torch.cat([generated, next_token], dim=1)
 
-            # If all sequences in the batch have generated the <eos> token, we can stop early
             if (next_token.squeeze(1) == self.config.end_token).all():
                 break
 
-        return generated[:, 1:]  # drop initial start token
-
+        return generated[:, 1:]
 
 
 if __name__ == "__main__":
@@ -278,9 +280,8 @@ if __name__ == "__main__":
     
     images = torch.rand(2, 1, 128, 512)
     output = model(images)
-    print(f"Generation output shape: {output.shape}")  # Should be (2, tgt_len)
+    print(f"Generation output shape: {output.shape}")
 
-    # Test with target tokens (training mode)
-    target_tokens = torch.randint(0, config.vocab_size, (2, 10))  # batch_size=2, seq_len=10
+    target_tokens = torch.randint(0, config.vocab_size, (2, 10))
     logits = model(images, target_tokens)
-    print(f"Training logits shape: {logits.shape}")  # Should be (2, 10, vocab_size)
+    print(f"Training logits shape: {logits.shape}")
